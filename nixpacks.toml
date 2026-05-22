@@ -1,0 +1,22 @@
+# nixpacks.toml
+[phases.setup]
+nixPkgs = ["..."] # Keep default packages
+
+[phases.install]
+cmds = ["npm ci"]
+
+[phases.build]
+cmds = ["npm run build"] # Only include if you have a build script, otherwise omit
+
+[phases.setup]
+nixPkgs = ["libx11", "libxcomposite", "libxdamage", "libxext", "libxfixes", "libxrandr", "libgbm", "libxkbcommon", "libwayland", "libdrm", "libglib", "libnss"]
+
+[build]
+# This ensures the browser is downloaded during build, not at runtime
+command = "npx puppeteer browsers install chrome"
+
+[start]
+cmd = "node server.js"
+
+[environment]
+PUPPETEER_SKIP_CHROMIUM_DOWNLOAD = "false" # Ensure Chromium is downloaded
