@@ -17,6 +17,9 @@ const twilioClient = twilio(
   process.env.TWILIO_AUTH_TOKEN
 );
 
+// ──────────────────────────────────────────────
+//  Twilio WhatsApp Webhook
+// ──────────────────────────────────────────────
 app.post('/webhook/whatsapp', async (req, res) => {
   const from = req.body.From;
   const mediaUrl = req.body.MediaUrl0;
@@ -25,7 +28,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
   console.log(`[WEBHOOK] From: ${from} | Media: ${mediaUrl} | Type: ${mediaType}`);
 
   if (!mediaUrl) {
-    await sendWhatsApp(from, '👋 Welcome! Send a PDF/DOCX for plagiarism check.');
+    await sendWhatsApp(from, '👋 Welcome! Send a PDF or DOCX file for plagiarism check.');
     return res.sendStatus(200);
   }
 
@@ -78,131 +81,91 @@ async function downloadTwilioFile(url) {
 async function runTurnitProCheck(filePath, tmpDir) {
   const browser = await puppeteer.launch({
     headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu'
+    ]
   });
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 800 });
+  page.setDefaultTimeout(60000);
 
   try {
     // ---------- LOGIN ----------
-    console.log('[LOGIN] Navigating to turnitpro.com...');
+    console.log('[LOGIN] Navigating to turnitpro.com/login...');
     await page.goto('https://turnitpro.com/login', { waitUntil: 'networkidle2', timeout: 30000 });
     await page.screenshot({ path: '/tmp/1-login-page.png' });
 
-    // Check if already logged in (dashboard)
-    const currentUrl = page.url();
-    if (currentUrl.includes('/dashboard')) {
-      console.log('[LOGIN] Already logged in.');
+    if (page.url().includes('/dashboard')) {
+      console.log('[LOGIN] Already on dashboard.');
     } else {
-      // Wait for email field (try multiple selectors)
-      const emailSelector = '#email, input[name="email"], input[type="email"]';
-      await page.waitForSelector(emailSelector, { timeout: 10000 });
-      await page.type(emailSelector, process.env.TURNITPRO_EMAIL, { delay: 50 });
-
-      const passwordSelector = '#password, input[name="password"], input[type="password"]';
-      await page.waitForSelector(passwordSelector, { timeout: 10000 });
-      await page.type(passwordSelector, process.env.TURNITPRO_PASSWORD, { delay: 50 });
-
-      // Try to click login button
-      const loginXPaths = [
-        '//button[contains(text(),"Sign In")]',
-        '//button[contains(text(),"Login")]',
-        '//button[@type="submit"]',
-        '//input[@type="submit"]'
-      ];
-      let clicked = false;
-      for (const xp of loginXPaths) {
-        const [btn] = await page.$x(xp);
-        if (btn) {
-          console.log(`[LOGIN] Clicking with XPath: ${xp}`);
-          await Promise.all([
-            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }),
-            btn.click()
-          ]);
-          clicked = true;
-          break;
-        }
+      await page.waitForSelector('input[name="email"]', { timeout: 10000 });
+      await page.type('input[name="email"]', process.env.TURNITPRO_EMAIL, { delay: 50 });
+      await page.type('input[name="password"]', process.env.TURNITPRO_PASSWORD, { delay: 50 });
+      const [signInBtn] = await page.$x('//button[normalize-space()="Sign In"]');
+      if (!signInBtn) throw new Error('Sign In button not found');
+      await signInBtn.click();
+      await Promise.race([
+        page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }),
+        page.waitForSelector('.dashboard, .upload-area', { timeout: 15000 }).catch(() => {})
+      ]);
+      await page.waitForTimeout(3000);
+      if (page.url().includes('/login')) {
+        await page.screenshot({ path: '/tmp/login-failed.png' });
+        throw new Error('Login failed – still on login page. Check credentials.');
       }
-      if (!clicked) throw new Error('Login button not found');
-
-      console.log('[LOGIN] Post-login URL:', page.url());
-      await page.screenshot({ path: '/tmp/2-after-login.png' });
+      console.log('[LOGIN] Success. Dashboard URL:', page.url());
+      await page.screenshot({ path: '/tmp/2-dashboard.png' });
     }
 
-    // ---------- UPLOAD SECTION ----------
-    // Wait a bit for dashboard to load
-    await page.waitForTimeout(3000);
+    // ---------- FILL NAME FIELDS (optional) ----------
+    console.log('[DASHBOARD] Filling name fields if present...');
+    const firstNameField = await page.$('input[placeholder*="First"], input[name="first_name"]');
+    if (firstNameField) await firstNameField.type('AutoUser', { delay: 30 });
+    const lastNameField = await page.$('input[placeholder*="Last"], input[name="last_name"]');
+    if (lastNameField) await lastNameField.type('Bot', { delay: 30 });
 
-    // Try to find upload area
-    let uploadFound = false;
-    const uploadButtons = [
-      '//a[contains(text(),"Upload")]',
-      '//a[contains(text(),"New Check")]',
-      '//button[contains(text(),"Upload")]',
-      '//a[contains(@href,"upload")]',
-      '//a[contains(@href,"check")]'
-    ];
-    for (const xp of uploadButtons) {
-      const [btn] = await page.$x(xp);
-      if (btn) {
-        console.log(`[UPLOAD] Clicking: ${xp}`);
-        await btn.click();
-        await page.waitForTimeout(2000);
-        uploadFound = true;
-        break;
-      }
-    }
-
-    if (!uploadFound) {
-      // Try direct navigation to common upload paths
-      const paths = ['/upload', '/check', '/submit', '/dashboard'];
-      for (const p of paths) {
-        await page.goto(`https://turnitpro.com${p}`, { waitUntil: 'networkidle2', timeout: 10000 });
-        const hasFileInput = await page.$('input[type="file"]');
-        if (hasFileInput) {
-          console.log(`[UPLOAD] Found file input at ${p}`);
-          uploadFound = true;
-          break;
-        }
-      }
-    }
-
-    if (!uploadFound) throw new Error('Could not reach upload page');
-
-    // ---------- ATTACH FILE ----------
+    // ---------- UPLOAD FILE ----------
+    console.log('[UPLOAD] Looking for file input...');
     const fileInput = await page.waitForSelector('input[type="file"]', { timeout: 10000 });
-    if (!fileInput) throw new Error('No file input element');
-
+    if (!fileInput) throw new Error('File input not found');
     await fileInput.uploadFile(filePath);
     console.log('[UPLOAD] File attached');
     await page.waitForTimeout(3000);
 
-    // ---------- SUBMIT ----------
-    const submitXPaths = [
-      '//button[@type="submit"]',
-      '//button[contains(text(),"Submit")]',
-      '//button[contains(text(),"Check")]',
-      '//input[@type="submit"]'
-    ];
-    let submitted = false;
-    for (const xp of submitXPaths) {
-      const [btn] = await page.$x(xp);
-      if (btn && await btn.isVisible()) {
-        console.log(`[SUBMIT] Clicking: ${xp}`);
-        await btn.click();
-        submitted = true;
-        break;
-      }
-    }
-    if (!submitted) throw new Error('Submit button not found');
+    // ---------- CLICK ANALYZE ----------
+    const [analyzeBtn] = await page.$x('//button[normalize-space()="Analyze"]');
+    if (!analyzeBtn) throw new Error('Analyze button not found');
+    console.log('[ANALYZE] Clicking Analyze...');
+    await analyzeBtn.click();
 
-    console.log('[CHECK] Waiting for report...');
-    const reportUrl = await pollForReport(page);
-    await page.goto(reportUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+    // ---------- WAIT FOR REPORT IN RECENT REPORTS TABLE ----------
+    console.log('[REPORT] Waiting for analysis to complete and appear in Recent Reports...');
+    await waitForReportCompletion(page);
+
+    // ---------- CLICK THE VIEW (EYE) ICON FOR THE MOST RECENT REPORT ----------
+    console.log('[REPORT] Clicking view icon on the completed report...');
+    await clickViewIconForMostRecentReport(page);
+
+    // ---------- NOW ON REPORT DETAILS PAGE: CLICK "View Plagiarism Report" BUTTON ----------
+    console.log('[REPORT] Clicking "View Plagiarism Report" button...');
+    const [viewPlagiarismBtn] = await page.$x('//a[contains(text(),"View Plagiarism Report")]');
+    if (!viewPlagiarismBtn) throw new Error('View Plagiarism Report button not found');
+    await viewPlagiarismBtn.click();
     await page.waitForTimeout(5000);
+    await page.screenshot({ path: '/tmp/final-report-page.png' });
 
-    const reportPath = path.join(tmpDir, 'report.pdf');
-    await page.pdf({ path: reportPath, format: 'A4' });
+    // ---------- GENERATE PDF OF THE FINAL REPORT ----------
+    const reportPath = path.join(tmpDir, 'turnitpro_report.pdf');
+    await page.pdf({
+      path: reportPath,
+      format: 'A4',
+      printBackground: true,
+      margin: { top: '15mm', bottom: '15mm', left: '15mm', right: '15mm' }
+    });
+    console.log('[PDF] Report saved');
     return reportPath;
 
   } catch (err) {
@@ -213,42 +176,82 @@ async function runTurnitProCheck(filePath, tmpDir) {
   }
 }
 
-async function pollForReport(page, maxWaitMs = 600000) {
+/**
+ * Waits for the most recent report in the Recent Reports table to have status "Completed".
+ * Polls every 10 seconds, refreshes the Reports tab.
+ */
+async function waitForReportCompletion(page, maxWaitMs = 600000) {
   const start = Date.now();
-  const interval = 15000;
+  const interval = 10000;
+
+  // Go to Reports tab first
+  await goToReportsTab(page);
 
   while (Date.now() - start < maxWaitMs) {
-    const url = page.url();
-    console.log(`[POLL] ${url}`);
-
-    // Look for report link
-    const [reportLink] = await page.$x('//a[contains(@href, "report") or contains(@href, "result")]');
-    if (reportLink) {
-      const href = await page.evaluate(el => el.href, reportLink);
-      if (href) return href;
+    console.log(`[REPORT] Checking Reports table for "Completed" status...`);
+    const rows = await page.$$('table tbody tr');
+    if (rows.length > 0) {
+      const firstRow = rows[0];
+      const statusCell = await firstRow.$('td:nth-child(4)'); // Assume 4th column is STATUS
+      if (statusCell) {
+        const statusText = await page.evaluate(el => el.innerText.trim(), statusCell);
+        if (statusText === 'Completed') {
+          console.log('[REPORT] Most recent report is Completed.');
+          return;
+        }
+      }
     }
-
-    // Look for similarity score on current page
-    const hasScore = await page.evaluate(() => {
-      const text = document.body.innerText;
-      return /similarity\s*:?\s*\d+%/i.test(text) || /plagiarism\s*:?\s*\d+%/i.test(text);
-    });
-    if (hasScore) return url;
-
-    // Check history page
-    await page.goto('https://turnitpro.com/history', { waitUntil: 'networkidle2', timeout: 10000 });
-    const [historyLink] = await page.$x('//a[contains(@href, "report")]');
-    if (historyLink) {
-      const href = await page.evaluate(el => el.href, historyLink);
-      if (href) return href;
-    }
-
-    console.log(`[POLL] Not ready, waiting ${interval/1000}s...`);
+    console.log(`[REPORT] Not completed yet. Waiting ${interval/1000}s...`);
     await page.waitForTimeout(interval);
+    // Refresh the Reports tab to see updated status
+    await goToReportsTab(page);
   }
-  throw new Error('Report timeout');
+  throw new Error('Report did not reach Completed status within timeout');
 }
 
+/**
+ * Clicks the view icon (eye) in the last column of the most recent report row.
+ */
+async function clickViewIconForMostRecentReport(page) {
+  // Ensure we are on the Reports page
+  await goToReportsTab(page);
+  const rows = await page.$$('table tbody tr');
+  if (rows.length === 0) throw new Error('No reports found in table');
+  const firstRow = rows[0];
+  // Look for an <a> or <button> inside the last <td>
+  const viewElement = await firstRow.$('td:last-child a, td:last-child button');
+  if (viewElement) {
+    await viewElement.click();
+    await page.waitForTimeout(5000);
+    return;
+  }
+  // Alternatively, look for an image with alt containing "view" or an SVG
+  const eyeIcon = await firstRow.$('td:last-child img, td:last-child svg');
+  if (eyeIcon) {
+    await eyeIcon.click();
+    await page.waitForTimeout(5000);
+    return;
+  }
+  throw new Error('View icon (eye) not found in the most recent report row');
+}
+
+/**
+ * Helper: Navigate to the Reports tab by clicking the link that contains "Reports".
+ */
+async function goToReportsTab(page) {
+  const [reportsTab] = await page.$x('//a[contains(text(),"Reports")]');
+  if (!reportsTab) {
+    // If not found, maybe we are already on the Reports page
+    if (!page.url().includes('/reports')) {
+      throw new Error('Reports tab not found');
+    }
+    return;
+  }
+  await reportsTab.click();
+  await page.waitForTimeout(3000);
+}
+
+// ---------- REPORT STORAGE AND DELIVERY ----------
 const reportStore = {};
 
 async function sendReportViaWhatsApp(to, pdfPath) {
@@ -261,13 +264,13 @@ async function sendReportViaWhatsApp(to, pdfPath) {
     from: process.env.TWILIO_WHATSAPP_FROM,
     to,
     mediaUrl: [publicUrl],
-    body: '📄 Your similarity report is attached.'
+    body: '📄 Your TurnitPro similarity report is attached.'
   });
 }
 
 app.get('/reports/:id', (req, res) => {
   const pdfPath = reportStore[req.params.id];
-  if (!pdfPath || !fs.existsSync(pdfPath)) return res.status(404).send('Expired');
+  if (!pdfPath || !fs.existsSync(pdfPath)) return res.status(404).send('Report expired');
   res.setHeader('Content-Type', 'application/pdf');
   fs.createReadStream(pdfPath).pipe(res);
 });
@@ -283,4 +286,4 @@ async function sendWhatsApp(to, text) {
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Bot running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Bot running on port ${PORT}`));
