@@ -12,15 +12,11 @@ app.use(express.json());
 
 const upload = multer({ dest: '/tmp/uploads/' });
 
-// All credentials come from environment variables
 const twilioClient = twilio(
   process.env.TWILIO_ACCOUNT_SID,
   process.env.TWILIO_AUTH_TOKEN
 );
 
-// ──────────────────────────────────────────────
-//  STEP 1: Twilio WhatsApp Webhook
-// ──────────────────────────────────────────────
 app.post('/webhook/whatsapp', async (req, res) => {
   const from = req.body.From;
   const mediaUrl = req.body.MediaUrl0;
@@ -29,65 +25,45 @@ app.post('/webhook/whatsapp', async (req, res) => {
   console.log(`[WEBHOOK] From: ${from} | Media: ${mediaUrl} | Type: ${mediaType}`);
 
   if (!mediaUrl) {
-    await sendWhatsApp(from,
-      '👋 Welcome to AutoTurnitin!\n\nPlease upload your document (PDF or DOCX) and I will check it for plagiarism automatically.'
-    );
+    await sendWhatsApp(from, '👋 Welcome! Send a PDF/DOCX for plagiarism check.');
     return res.sendStatus(200);
   }
 
   const allowed = ['application/pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'];
   if (!allowed.some(t => mediaType?.includes(t.split('/')[1]))) {
-    await sendWhatsApp(from,
-      '⚠️ Unsupported file type.\n\nPlease send a *PDF* or *DOCX* file only.'
-    );
+    await sendWhatsApp(from, '⚠️ Only PDF or DOCX files are supported.');
     return res.sendStatus(200);
   }
 
-  await sendWhatsApp(from,
-    '✅ File received!\n\n⏳ Uploading to TurnitPro and running similarity check...\n\nThis usually takes *3–5 minutes*. I\'ll send the report automatically when ready.'
-  );
-
+  await sendWhatsApp(from, '✅ File received! Starting check (3-5 min).');
   res.sendStatus(200);
 
   runPipeline(from, mediaUrl, mediaType).catch(err => {
     console.error('[PIPELINE ERROR]', err);
-    sendWhatsApp(from, '❌ Something went wrong during the check. Please try again or contact support.');
+    sendWhatsApp(from, '❌ Error. Check logs.');
   });
 });
 
-// ──────────────────────────────────────────────
-//  STEP 2: Full Pipeline
-// ──────────────────────────────────────────────
 async function runPipeline(to, mediaUrl, mediaType) {
   const tmpDir = `/tmp/${Date.now()}`;
   fs.mkdirSync(tmpDir, { recursive: true });
 
   try {
-    console.log('[PIPELINE] Downloading file from Twilio...');
     const fileBuffer = await downloadTwilioFile(mediaUrl);
     const ext = mediaType.includes('pdf') ? 'pdf' : 'docx';
     const filePath = path.join(tmpDir, `submission.${ext}`);
     fs.writeFileSync(filePath, fileBuffer);
-    console.log(`[PIPELINE] File saved: ${filePath}`);
 
-    console.log('[PIPELINE] Starting TurnitPro automation...');
     const reportPath = await runTurnitProCheck(filePath, tmpDir);
-    console.log(`[PIPELINE] Report generated: ${reportPath}`);
-
-    console.log('[PIPELINE] Sending report via WhatsApp...');
     await sendReportViaWhatsApp(to, reportPath);
-
   } catch (error) {
-    console.error('[PIPELINE ERROR]', error);
-    await sendWhatsApp(to, `❌ An error occurred: ${error.message}. Please try again later.`);
+    console.error(error);
+    await sendWhatsApp(to, `❌ ${error.message}`);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 }
 
-// ──────────────────────────────────────────────
-//  STEP 3: Download file from Twilio CDN
-// ──────────────────────────────────────────────
 async function downloadTwilioFile(url) {
   const response = await axios.get(url, {
     responseType: 'arraybuffer',
@@ -99,197 +75,178 @@ async function downloadTwilioFile(url) {
   return Buffer.from(response.data);
 }
 
-// ──────────────────────────────────────────────
-//  STEP 4: TurnitPro Automation (fixed selectors)
-// ──────────────────────────────────────────────
 async function runTurnitProCheck(filePath, tmpDir) {
   const browser = await puppeteer.launch({
     headless: 'new',
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu'
-    ]
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
   });
-
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 800 });
 
   try {
-    console.log('[TURNITPRO] Navigating to login page...');
-    await page.goto('https://turnitpro.com/login', {
-      waitUntil: 'networkidle2',
-      timeout: 30000
-    });
+    // ---------- LOGIN ----------
+    console.log('[LOGIN] Navigating to turnitpro.com...');
+    await page.goto('https://turnitpro.com/login', { waitUntil: 'networkidle2', timeout: 30000 });
+    await page.screenshot({ path: '/tmp/1-login-page.png' });
 
-    await page.screenshot({ path: '/tmp/login-page.png' });
-    console.log('[TURNITPRO] Login page loaded');
+    // Check if already logged in (dashboard)
+    const currentUrl = page.url();
+    if (currentUrl.includes('/dashboard')) {
+      console.log('[LOGIN] Already logged in.');
+    } else {
+      // Wait for email field (try multiple selectors)
+      const emailSelector = '#email, input[name="email"], input[type="email"]';
+      await page.waitForSelector(emailSelector, { timeout: 10000 });
+      await page.type(emailSelector, process.env.TURNITPRO_EMAIL, { delay: 50 });
 
-    await page.waitForSelector('#email, input[name="email"]', { timeout: 10000 });
-    await page.type('#email, input[name="email"]', process.env.TURNITPRO_EMAIL, { delay: 60 });
+      const passwordSelector = '#password, input[name="password"], input[type="password"]';
+      await page.waitForSelector(passwordSelector, { timeout: 10000 });
+      await page.type(passwordSelector, process.env.TURNITPRO_PASSWORD, { delay: 50 });
 
-    await page.waitForSelector('#password, input[name="password"]', { timeout: 10000 });
-    await page.type('#password, input[name="password"]', process.env.TURNITPRO_PASSWORD, { delay: 60 });
-
-    const loginButtonXPath = '//button[contains(text(),"Sign In") or contains(text(),"Login") or contains(@class,"submit-btn")]';
-    const [loginButton] = await page.$x(loginButtonXPath);
-    if (!loginButton) throw new Error('Login button not found');
-    await Promise.all([
-      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }),
-      loginButton.click()
-    ]);
-
-    console.log('[TURNITPRO] Logged in. Current URL:', page.url());
-    await page.screenshot({ path: '/tmp/dashboard.png' });
-
-    let uploadPageFound = false;
-    const possibleUploadUrls = [
-      'https://turnitpro.com/dashboard',
-      'https://turnitpro.com/upload',
-      'https://turnitpro.com/check',
-      'https://turnitpro.com/submit'
-    ];
-
-    for (const url of possibleUploadUrls) {
-      try {
-        await page.goto(url, { waitUntil: 'networkidle2', timeout: 15000 });
-        const fileInput = await page.$('input[type="file"]');
-        if (fileInput) {
-          console.log(`[TURNITPRO] Upload page found at: ${url}`);
-          uploadPageFound = true;
-          break;
-        }
-      } catch (e) {
-        console.log(`[TURNITPRO] ${url} not accessible, trying next...`);
-      }
-    }
-
-    if (!uploadPageFound) {
-      console.log('[TURNITPRO] Searching for upload link on dashboard...');
-      const uploadLinkXPaths = [
-        '//a[contains(text(),"Upload")]',
-        '//a[contains(text(),"New Check")]',
-        '//a[contains(text(),"Submit")]',
-        '//button[contains(text(),"Upload")]',
-        '//*[contains(@class,"upload-btn")]'
+      // Try to click login button
+      const loginXPaths = [
+        '//button[contains(text(),"Sign In")]',
+        '//button[contains(text(),"Login")]',
+        '//button[@type="submit"]',
+        '//input[@type="submit"]'
       ];
       let clicked = false;
-      for (const xp of uploadLinkXPaths) {
-        const [link] = await page.$x(xp);
-        if (link) {
-          await link.click();
-          await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 });
+      for (const xp of loginXPaths) {
+        const [btn] = await page.$x(xp);
+        if (btn) {
+          console.log(`[LOGIN] Clicking with XPath: ${xp}`);
+          await Promise.all([
+            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }),
+            btn.click()
+          ]);
           clicked = true;
           break;
         }
       }
-      if (!clicked) throw new Error('No upload page or upload button found on TurnitPro');
+      if (!clicked) throw new Error('Login button not found');
+
+      console.log('[LOGIN] Post-login URL:', page.url());
+      await page.screenshot({ path: '/tmp/2-after-login.png' });
     }
 
-    console.log('[TURNITPRO] Looking for file input...');
-    const fileInput = await page.waitForSelector('input[type="file"]', { timeout: 15000 });
-    if (!fileInput) throw new Error('File input not found on upload page');
+    // ---------- UPLOAD SECTION ----------
+    // Wait a bit for dashboard to load
+    await page.waitForTimeout(3000);
 
-    await page.evaluate(() => {
-      const input = document.querySelector('input[type="file"]');
-      if (input) {
-        input.style.display = 'block';
-        input.style.visibility = 'visible';
-        input.style.opacity = '1';
-      }
-    });
-
-    await fileInput.uploadFile(filePath);
-    console.log('[TURNITPRO] File attached.');
-    await page.waitForTimeout(2000);
-
-    console.log('[TURNITPRO] Submitting for plagiarism check...');
-    const submitXPaths = [
-      '//button[@type="submit"]',
-      '//input[@type="submit"]',
-      '//button[contains(text(),"Submit")]',
-      '//button[contains(text(),"Check")]',
-      '//*[contains(@class,"submit-btn")]'
+    // Try to find upload area
+    let uploadFound = false;
+    const uploadButtons = [
+      '//a[contains(text(),"Upload")]',
+      '//a[contains(text(),"New Check")]',
+      '//button[contains(text(),"Upload")]',
+      '//a[contains(@href,"upload")]',
+      '//a[contains(@href,"check")]'
     ];
-    let submitted = false;
-    for (const xp of submitXPaths) {
+    for (const xp of uploadButtons) {
       const [btn] = await page.$x(xp);
       if (btn) {
-        const isVisible = await page.evaluate(el => {
-          const s = window.getComputedStyle(el);
-          return s.display !== 'none' && s.visibility !== 'hidden';
-        }, btn);
-        if (isVisible) {
-          await Promise.all([
-            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {}),
-            btn.click()
-          ]);
-          submitted = true;
+        console.log(`[UPLOAD] Clicking: ${xp}`);
+        await btn.click();
+        await page.waitForTimeout(2000);
+        uploadFound = true;
+        break;
+      }
+    }
+
+    if (!uploadFound) {
+      // Try direct navigation to common upload paths
+      const paths = ['/upload', '/check', '/submit', '/dashboard'];
+      for (const p of paths) {
+        await page.goto(`https://turnitpro.com${p}`, { waitUntil: 'networkidle2', timeout: 10000 });
+        const hasFileInput = await page.$('input[type="file"]');
+        if (hasFileInput) {
+          console.log(`[UPLOAD] Found file input at ${p}`);
+          uploadFound = true;
           break;
         }
       }
     }
-    if (!submitted) throw new Error('Submit button not found on upload page');
-    console.log('[TURNITPRO] File submitted. Waiting for report...');
 
+    if (!uploadFound) throw new Error('Could not reach upload page');
+
+    // ---------- ATTACH FILE ----------
+    const fileInput = await page.waitForSelector('input[type="file"]', { timeout: 10000 });
+    if (!fileInput) throw new Error('No file input element');
+
+    await fileInput.uploadFile(filePath);
+    console.log('[UPLOAD] File attached');
+    await page.waitForTimeout(3000);
+
+    // ---------- SUBMIT ----------
+    const submitXPaths = [
+      '//button[@type="submit"]',
+      '//button[contains(text(),"Submit")]',
+      '//button[contains(text(),"Check")]',
+      '//input[@type="submit"]'
+    ];
+    let submitted = false;
+    for (const xp of submitXPaths) {
+      const [btn] = await page.$x(xp);
+      if (btn && await btn.isVisible()) {
+        console.log(`[SUBMIT] Clicking: ${xp}`);
+        await btn.click();
+        submitted = true;
+        break;
+      }
+    }
+    if (!submitted) throw new Error('Submit button not found');
+
+    console.log('[CHECK] Waiting for report...');
     const reportUrl = await pollForReport(page);
-    console.log(`[TURNITPRO] Report ready at: ${reportUrl}`);
-
     await page.goto(reportUrl, { waitUntil: 'networkidle2', timeout: 30000 });
     await page.waitForTimeout(5000);
-    const reportPath = path.join(tmpDir, 'turnitpro_report.pdf');
-    await page.pdf({
-      path: reportPath,
-      format: 'A4',
-      printBackground: true,
-      margin: { top: '15mm', bottom: '15mm', left: '15mm', right: '15mm' }
-    });
-    console.log(`[TURNITPRO] PDF saved: ${reportPath}`);
+
+    const reportPath = path.join(tmpDir, 'report.pdf');
+    await page.pdf({ path: reportPath, format: 'A4' });
     return reportPath;
 
-  } catch (error) {
-    console.error('[TURNITPRO ERROR]', error);
-    await page.screenshot({ path: '/tmp/error-screenshot.png' });
-    throw error;
+  } catch (err) {
+    await page.screenshot({ path: '/tmp/error.png' });
+    throw err;
   } finally {
     await browser.close();
   }
 }
 
 async function pollForReport(page, maxWaitMs = 600000) {
-  const started = Date.now();
-  const interval = 20000;
+  const start = Date.now();
+  const interval = 15000;
 
-  while (Date.now() - started < maxWaitMs) {
-    const currentUrl = page.url();
-    console.log(`[TURNITPRO] Polling for report... URL: ${currentUrl}`);
+  while (Date.now() - start < maxWaitMs) {
+    const url = page.url();
+    console.log(`[POLL] ${url}`);
 
-    const reportLinkXPath = '//a[contains(@href, "report") or contains(@href, "result") or contains(@href, "similarity")]';
-    const [reportLink] = await page.$x(reportLinkXPath);
+    // Look for report link
+    const [reportLink] = await page.$x('//a[contains(@href, "report") or contains(@href, "result")]');
     if (reportLink) {
       const href = await page.evaluate(el => el.href, reportLink);
       if (href) return href;
     }
 
-    const scoreText = await page.evaluate(() => {
-      const elements = document.querySelectorAll('.similarity-score, .similarity-percentage, .plagiarism-score, [class*="similarity"], [class*="score"]');
-      for (const el of elements) {
-        if (el.textContent && /\d+\s*%/.test(el.textContent)) return el.textContent.trim();
-      }
-      const body = document.body.innerText;
-      const match = body.match(/similarity[:\s]+(\d+)%/i) || body.match(/plagiarism[:\s]+(\d+)%/i);
-      return match ? match[0] : null;
+    // Look for similarity score on current page
+    const hasScore = await page.evaluate(() => {
+      const text = document.body.innerText;
+      return /similarity\s*:?\s*\d+%/i.test(text) || /plagiarism\s*:?\s*\d+%/i.test(text);
     });
-    if (scoreText) {
-      console.log(`[TURNITPRO] Similarity score detected: ${scoreText}`);
-      return currentUrl;
+    if (hasScore) return url;
+
+    // Check history page
+    await page.goto('https://turnitpro.com/history', { waitUntil: 'networkidle2', timeout: 10000 });
+    const [historyLink] = await page.$x('//a[contains(@href, "report")]');
+    if (historyLink) {
+      const href = await page.evaluate(el => el.href, historyLink);
+      if (href) return href;
     }
 
-    console.log(`[TURNITPRO] Not ready yet. Waiting ${interval/1000}s...`);
-    await new Promise(r => setTimeout(r, interval));
+    console.log(`[POLL] Not ready, waiting ${interval/1000}s...`);
+    await page.waitForTimeout(interval);
   }
-  throw new Error('TurnitPro report timed out after 10 minutes.');
+  throw new Error('Report timeout');
 }
 
 const reportStore = {};
@@ -297,7 +254,6 @@ const reportStore = {};
 async function sendReportViaWhatsApp(to, pdfPath) {
   const reportId = path.basename(path.dirname(pdfPath));
   const publicUrl = `${process.env.PUBLIC_BASE_URL}/reports/${reportId}`;
-
   reportStore[reportId] = pdfPath;
   setTimeout(() => delete reportStore[reportId], 30 * 60 * 1000);
 
@@ -305,17 +261,14 @@ async function sendReportViaWhatsApp(to, pdfPath) {
     from: process.env.TWILIO_WHATSAPP_FROM,
     to,
     mediaUrl: [publicUrl],
-    body: '📄 *Your TurnitPro Report is Ready!*\n\nThe PDF above contains your full similarity report including:\n• Overall similarity score\n• Matched sources breakdown\n• Highlighted text sections\n\n_Report expires in 30 minutes._'
+    body: '📄 Your similarity report is attached.'
   });
 }
 
 app.get('/reports/:id', (req, res) => {
   const pdfPath = reportStore[req.params.id];
-  if (!pdfPath || !fs.existsSync(pdfPath)) {
-    return res.status(404).send('Report not found or expired');
-  }
+  if (!pdfPath || !fs.existsSync(pdfPath)) return res.status(404).send('Expired');
   res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', 'attachment; filename="turnitpro_report.pdf"');
   fs.createReadStream(pdfPath).pipe(res);
 });
 
@@ -327,11 +280,7 @@ async function sendWhatsApp(to, text) {
   });
 }
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 AutoTurnitPro bot running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Bot running on port ${PORT}`));
