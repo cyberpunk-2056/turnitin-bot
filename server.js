@@ -12,15 +12,11 @@ app.use(express.json());
 
 const upload = multer({ dest: '/tmp/uploads/' });
 
-// ──────────────────────────────────────────────
-//  HARDCODED TWILIO CREDENTIALS (INSECURE)
-//  Replace with environment variables in production.
-// ──────────────────────────────────────────────
-const accountSid = 'AC14934954ffb9bd68e75a120903104ca5';
-const authToken = '5b869a986c6eee2ef4af8829a27e1926';
-const twilioWhatsappFrom = 'whatsapp:+14155238886';
-
-const twilioClient = twilio(accountSid, authToken);
+// All credentials come from environment variables
+const twilioClient = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
 
 // ──────────────────────────────────────────────
 //  STEP 1: Twilio WhatsApp Webhook
@@ -96,8 +92,8 @@ async function downloadTwilioFile(url) {
   const response = await axios.get(url, {
     responseType: 'arraybuffer',
     auth: {
-      username: accountSid,
-      password: authToken
+      username: process.env.TWILIO_ACCOUNT_SID,
+      password: process.env.TWILIO_AUTH_TOKEN
     }
   });
   return Buffer.from(response.data);
@@ -300,13 +296,13 @@ const reportStore = {};
 
 async function sendReportViaWhatsApp(to, pdfPath) {
   const reportId = path.basename(path.dirname(pdfPath));
-  const publicUrl = `${process.env.PUBLIC_BASE_URL || 'https://turnitin-bot-production.up.railway.app'}/reports/${reportId}`;
+  const publicUrl = `${process.env.PUBLIC_BASE_URL}/reports/${reportId}`;
 
   reportStore[reportId] = pdfPath;
   setTimeout(() => delete reportStore[reportId], 30 * 60 * 1000);
 
   await twilioClient.messages.create({
-    from: twilioWhatsappFrom,
+    from: process.env.TWILIO_WHATSAPP_FROM,
     to,
     mediaUrl: [publicUrl],
     body: '📄 *Your TurnitPro Report is Ready!*\n\nThe PDF above contains your full similarity report including:\n• Overall similarity score\n• Matched sources breakdown\n• Highlighted text sections\n\n_Report expires in 30 minutes._'
@@ -325,7 +321,7 @@ app.get('/reports/:id', (req, res) => {
 
 async function sendWhatsApp(to, text) {
   return twilioClient.messages.create({
-    from: twilioWhatsappFrom,
+    from: process.env.TWILIO_WHATSAPP_FROM,
     to,
     body: text
   });
