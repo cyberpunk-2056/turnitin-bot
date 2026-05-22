@@ -10,7 +10,7 @@ WORKDIR /app
 COPY package*.json ./
 
 # Install app dependencies and necessary system libraries for Puppeteer
-RUN npm ci && \
+RUN npm install && \
     apt-get update && \
     apt-get install -y \
       gconf-service \
