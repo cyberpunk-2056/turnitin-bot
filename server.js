@@ -107,15 +107,14 @@ async function downloadTwilioFile(url) {
 async function runTurnitinCheck(filePath, tmpDir) {
   // Launch browser in non-headless mode for debugging (remove when working)
   const browser = await puppeteer.launch({
-    headless: false, // Change to 'new' when everything is working
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-    ]
-  });
-
+  headless: true,
+  args: [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-gpu',
+  ]
+});
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 800 });
 
